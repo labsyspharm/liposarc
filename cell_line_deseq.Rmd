@@ -37,7 +37,8 @@ conflicts_prefer(
   dplyr::slice,
   dplyr::rename,
   purrr::reduce,
-  DESeq2::counts
+  DESeq2::counts,
+  dplyr::desc
 )
 
 theme_set(
@@ -179,6 +180,20 @@ deseq_norm <- DESeqDataSetFromMatrix(
 ```{r transform-counts}
 vst_raw <- vst(deseq_norm, blind = TRUE) |>
   assay()
+```
+
+
+```{r count-mats}
+count_mats <- list(
+  raw = counts(deseq_norm, normalized = FALSE),
+  norm = counts(deseq_norm, normalized = TRUE),
+  vst = vst_raw
+)
+
+qs_save(
+  count_mats,
+  file = file.path(res_dir, "count_mats.qs")
+)
 ```
 
 ## PCA
@@ -377,7 +392,6 @@ de_res |>
 ```
 
 
-
 ```{r cluster-helpers}
 cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
   # browser()
@@ -431,11 +445,15 @@ msigdbr_of_interest <- tribble(
     gs = map2(
       collection, subcollection,
       \(c, s) {
-        if (is.na(s)) {
+        df <- if (is.na(s)) {
           msigdbr::msigdbr(species = "Homo sapiens", collection = c)
         } else {
           msigdbr::msigdbr(species = "Homo sapiens", collection = c, subcollection = s)
         }
+        df  |>
+          filter(
+            !str_starts(gs_name, coll("KEGG_MEDICUS_PATHOGEN"))
+          )
       }
     )
   )
@@ -503,6 +521,13 @@ fgsea_heatmap_data <- fgsea_res |>
   filter(dense_rank(min_padj) <= 40) |>
   ungroup() |>
   mutate(
+    pathway_display = pathway |>
+      str_remove(coll("KEGG_MEDICUS_REFERENCE_")) |>
+      str_remove(coll("KEGG_MEDICUS_")) |>
+      str_remove(coll("HALLMARK_")) |>
+      str_remove(coll("GAVISH_3CA_")) |>
+      str_replace_all("_", " ") |>
+      str_wrap(width = 50),
     signif = case_when(
       padj < 0.001 ~ "***",
       padj < 0.01 ~ "**",
@@ -518,14 +543,24 @@ fgsea_heatmaps <- fgsea_heatmap_data |>
     p = pmap(
       list(data, gs_collection_id, line_type),
       \(df, coll, lt) {
-        df_clust <- cluster_df(df, pathway, cell_line, NES)
+        df_clust <- cluster_df(df, pathway_display, cell_line, NES)
         lim <- max(abs(df_clust$NES), na.rm = TRUE)
-        ggplot(df_clust, aes(x = cell_line, y = pathway, fill = NES)) +
+        ggplot(
+          df_clust,
+          aes(
+            x = cell_line,
+            y = pathway_display,
+            fill = NES
+          )
+        ) +
           geom_tile() +
           geom_text(aes(label = signif), vjust = 0.75) +
           scale_fill_distiller(palette = "RdBu", limits = c(-lim, lim)) +
           labs(x = NULL, y = NULL, title = paste(lt, coll, sep = " - ")) +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(lineheight = 0.7)
+          )
       }
     )
   )
@@ -544,5 +579,118 @@ pwalk(
       limitsize = FALSE
     )
   }
+)
+```
+
+
+## Volcano plots
+
+
+```{r volcano-plots}
+volcano_data <- de_res |>
+  filter(!is.na(padj)) |>
+  mutate(
+    gene_label = coalesce(gene_name, gene_id),
+    neg_log10_padj = -log10(pmax(padj, .Machine$double.xmin)),
+    direction = case_when(
+      padj < 0.05 & log2FoldChange > 0 ~ "up",
+      padj < 0.05 & log2FoldChange < 0 ~ "down",
+      TRUE ~ "ns"
+    )
+  ) |>
+  group_by(line_type, cell_line) |>
+  mutate(
+    y_cap = 1.5 * quantile(neg_log10_padj, 0.999),
+    y_cap = if_else(max(neg_log10_padj) > y_cap, y_cap, Inf),
+    truncated = neg_log10_padj > y_cap,
+    y_plot = pmin(neg_log10_padj, y_cap)
+  ) |>
+  group_by(line_type, cell_line, direction) |>
+  mutate(
+    label = if_else(
+      direction != "ns" & min_rank(desc(y_plot * abs(log2FoldChange))) <= 20,
+      gene_label, NA_character_
+    )
+  ) |>
+  ungroup()
+
+volcano_plots <- volcano_data |>
+  group_nest(line_type, keep = TRUE) |>
+  mutate(
+    p = map2(
+      data, line_type,
+      \(df, lt) {
+        ggplot(
+          df, aes(
+            x = log2FoldChange,
+            y = y_plot,
+            color = direction,
+            shape = truncated
+          )
+        ) +
+          rasterize(
+            geom_point(alpha = 0.6),
+            dpi = 300, dev = "ragg_png"
+          ) +
+          geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.3) +
+          geom_text_repel(
+            aes(label = label),
+            data = \(d) filter(d, !is.na(label)),
+            size = 2.5, max.overlaps = Inf, min.segment.length = 0,
+            segment.size = 0.2, show.legend = FALSE,
+            color = "black"
+          ) +
+          scale_color_manual(
+            values = c(up = "#B2182B", down = "#2166AC", ns = "grey70"),
+            guide = "none"
+          ) +
+          scale_shape_manual(
+            values = c(`TRUE` = 17, `FALSE` = 16),
+            guide = "none"
+          ) +
+          facet_wrap(~cell_line, scales = "free_y", ncol = 3) +
+          labs(
+            x = "log2 fold change (vs mean of other lines)",
+            y = "-log10(padj)",
+          ) +
+          theme_bw()
+      }
+    )
+  )
+
+pwalk(
+  volcano_plots,
+  \(line_type, data, p, ...) {
+    n_lines <- n_distinct(data$cell_line)
+    ggsave(
+      file.path(plot_dir, paste0("volcano_", make_clean_names(line_type), ".pdf")),
+      p,
+      width = 4 * min(n_lines, 3),
+      height = 4 * ceiling(n_lines / 3)
+    )
+  }
+)
+```
+
+
+## Store on Synapse
+
+```{r synapse-store}
+syn_processed <- synMkdir(
+  "syn77490489", "processed"
+)
+
+synStoreMany(
+  c(
+    file.path(
+      res_dir, c(
+        "count_mats.qs",
+        "de_cell_line_vs_other_lines.csv.gz",
+        "fgsea_cell_line_vs_other_lines.csv.gz"
+      )
+    )
+  ),
+  parentId = syn_processed,
+  forceVersion = FALSE
 )
 ```
