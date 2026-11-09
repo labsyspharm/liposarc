@@ -1,0 +1,548 @@
+---
+title: "NGFR+ RNA-seq"
+author: "Clemens Hug"
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: false
+    toc_depth: 4
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup}
+library(conflicted)
+library(tidyverse)
+library(powerjoin)
+library(here)
+library(janitor)
+library(synExtra)
+library(DESeq2)
+library(readxl)
+library(ggrastr)
+library(ggrepel)
+library(ggbeeswarm)
+library(plotly)
+library(seriation)
+library(qs2)
+library(fgsea)
+
+conflicts_prefer(
+  dplyr::filter,
+  dplyr::count,
+  generics::setdiff,
+  dplyr::slice,
+  dplyr::rename,
+  purrr::reduce,
+  DESeq2::counts
+)
+
+theme_set(
+  theme_minimal(base_family = "Helvetica")
+)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+
+plot_dir <- here(
+  "plots"
+)
+res_dir <- here(
+  "results"
+)
+walk(
+  c(plot_dir, res_dir),
+  \(d) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+)
+
+```
+
+## Loading data
+
+Sample numbers restart in each sequencing run, so samples are identified by
+`sample_uid` = `<sequencing_batch>_<Sample>`.
+
+```{r load-data}
+counts_raw <- c(
+  "batch_1" = "syn78498675"
+) |>
+  map(\(x) {
+    zip <- syn(x)
+    f <- str_subset(unzip(zip, list = TRUE)$Name, "expression-matrix\\.tsv$")
+    read_tsv(unz(zip, f))
+  })
+
+gene_meta <- counts_raw |>
+  map(\(x) distinct(x, gene_id, gene_name, gene_biotype)) |>
+  bind_rows() |>
+  distinct()
+
+cell_line_meta <- tribble(
+  ~cell_line, ~line_type,
+  "CCOC-T", "Clear cell",
+  "CCS-292", "Clear cell",
+  "SU-CCS-1", "Clear cell",
+  "LP6", "Liposarcoma",
+  "93T449", "Liposarcoma",
+  "94T778", "Liposarcoma",
+  "Lipo 224", "Liposarcoma",
+  "Lipo 246", "Liposarcoma",
+  "Lipo 863", "Liposarcoma"
+)
+
+meta_raw <- c(
+  batch_1 = "syn78507424"
+) |>
+  map(
+    \(x) read_csv(
+      syn(x)
+    ) |>
+      clean_names()
+  ) |>
+  bind_rows(.id = "sequencing_batch") |>
+  mutate(
+    # Fix typo, standardize names
+    cell_line = recode(
+      cell_line,
+      "CSS-292" = "CCS-292",
+      "SU-CCS1" = "SU-CCS-1",
+      "93T-449" = "93T449",
+      "94T-778" = "94T778"
+    ),
+    sample_uid = paste(sequencing_batch, sample, sep = "_")
+  ) |>
+  power_inner_join(
+    cell_line_meta,
+    by = "cell_line",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+```
+
+
+```{r count-matrix}
+counts_long <- counts_raw |>
+  map(
+    \(x) x |>
+      select(gene_id, ends_with("_count")) |>
+      pivot_longer(
+        -gene_id,
+        names_to = c("library_id", "sample_id"),
+        names_pattern = "^([^_]+)_([0-9]+)_count$",
+        values_to = "count"
+      )
+  ) |>
+  bind_rows(.id = "sequencing_batch") |>
+  mutate(
+    sample_uid = paste(sequencing_batch, sample_id, sep = "_")
+  )
+
+count_mat <- counts_long |>
+  select(gene_id, sample_uid, count) |>
+  pivot_wider(
+    names_from = sample_uid,
+    values_from = count,
+    values_fill = 0
+  ) |>
+  column_to_rownames("gene_id") |>
+  as.matrix()
+
+genes_eligible <- rownames(count_mat)[rowSums(count_mat > 3) > 3] |>
+  str_subset("^ENSG")
+```
+
+## Prepare sample metadata and normalization
+
+```{r prepare-normalization}
+deseq_meta <- meta_raw |>
+  filter(sample_uid %in% colnames(count_mat))
+
+deseq_norm <- DESeqDataSetFromMatrix(
+  countData = count_mat[genes_eligible, deseq_meta$sample_uid] |>
+    round(),
+  colData = deseq_meta |>
+    column_to_rownames("sample_uid"),
+  design = ~ cell_line
+) |>
+  estimateSizeFactors() |>
+  estimateDispersions()
+```
+
+```{r transform-counts}
+vst_raw <- vst(deseq_norm, blind = TRUE) |>
+  assay()
+```
+
+## PCA
+
+```{r compute-pca}
+pca_meta <- deseq_meta
+
+pcas <- pca_meta |>
+  split(~line_type) |>
+  map(\(m) prcomp(t(vst_raw[, m$sample_uid]), scale. = FALSE, center = TRUE))
+
+pca_scores <- pcas |>
+  map(
+    \(pca) as_tibble(pca$x, rownames = "sample_uid") |>
+      power_inner_join(
+        pca_meta,
+        by = "sample_uid",
+        check = check_specs(
+          unmatched_keys_left = "warn",
+          duplicate_keys_right = "warn"
+        )
+      )
+  )
+
+pc_variance <- pcas |>
+  map(\(pca) set_names(pca$sdev^2 / sum(pca$sdev^2), colnames(pca$x)))
+```
+
+```{r plot-pca}
+pca_pairs <- combn(paste0("PC", seq_len(5)), 2, simplify = FALSE)
+
+make_pca_pairs <- function(scores, variance) {
+  map(pca_pairs, function(pair) {
+    axis_labels <- paste0(pair, " (", signif(variance[pair] * 100, 2), "%)")
+    scores |>
+      mutate(
+        value_1 = .data[[pair[1]]],
+        value_2 = .data[[pair[2]]],
+        facet_label = paste(axis_labels, collapse = " vs ")
+      ) |>
+      select(-matches("^PC[0-9]+$"))
+  }) |>
+    bind_rows()
+}
+
+pca_x_vs <- map2(pca_scores, pc_variance, make_pca_pairs) |>
+  bind_rows(.id = "pca_group")
+
+pca_plots <- pca_x_vs |>
+  group_nest(pca_group, keep = TRUE) |>
+  mutate(
+    p = map2(
+      data, pca_group,
+      \(df, grp) ggplot(
+        df,
+        aes(
+          x = value_1,
+          y = value_2,
+          color = cell_line
+        )
+      ) +
+        geom_point(
+          alpha = 0.8, size = 2
+        ) +
+        facet_wrap(~facet_label, scales = "free") +
+        labs(
+          x = NULL,
+          y = NULL,
+          title = grp
+        ) +
+        envalysis::theme_publish() +
+        theme(
+          legend.box = "vertical",
+          strip.clip = "off"
+        )
+    )
+  )
+
+pwalk(
+  pca_plots,
+  \(pca_group, p, ...) {
+    fname <- paste0("pca_vst_", make_clean_names(pca_group))
+    ggplotly(p, width = 1200, height = 1000) |>
+      htmlwidgets::saveWidget(
+        file.path(plot_dir, paste0(fname, ".html")),
+        selfcontained = TRUE
+      )
+    ggsave(
+      file.path(plot_dir, paste0(fname, ".pdf")),
+      p, width = 10, height = 8
+    )
+  }
+)
+```
+
+## Differential expression
+
+Each cell line vs mean of other cell lines
+
+
+```{r analysis-helpers}
+extract_deseq_result <- function(de, contrast, res_args = list()) {
+  res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  lfcShrink(de, res = res, type = "ashr") |>
+    as_tibble(rownames = "gene_id") |>
+    left_join(
+      res |>
+        as_tibble(rownames = "gene_id") |>
+        select(gene_id, log2FoldChange, lfcSE, stat),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+
+run_contrasts <- function(de, contrasts, gene_meta) {
+  contrasts |>
+    mutate(
+      res = map2(
+        contrast, res_args,
+        \(contrast, res_args) extract_deseq_result(de, contrast, res_args)
+      )
+    ) |>
+    select(-contrast, -res_args) |>
+    unnest(res) |>
+    power_left_join(
+      gene_meta,
+      by = "gene_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) |>
+    mutate(gene_label = coalesce(gene_name, gene_id))
+}
+```
+
+```{r de-fit}
+de_meta <- deseq_meta |>
+  mutate(
+    cell_line_coef = make_clean_names(cell_line, allow_dupes = TRUE)
+  )
+
+de_fits <- de_meta |>
+  split(~line_type) |>
+  map(\(m) {
+    cm <- count_mat[genes_eligible, m$sample_uid] |>
+      round()
+    DESeqDataSetFromMatrix(
+      countData = cm,
+      colData = m |>
+        column_to_rownames("sample_uid"),
+      design = ~ 0 + cell_line_coef
+    ) |>
+      DESeq()
+  })
+```
+
+```{r de-contrasts}
+one_vs_others <- function(dds, line_coef) {
+  coefs <- resultsNames(dds)
+  line_coefs <- paste0("cell_line_coef", levels(dds$cell_line_coef))
+  stopifnot(all(line_coefs %in% coefs))
+  target <- paste0("cell_line_coef", line_coef)
+  others <- setdiff(line_coefs, target)
+  w <- set_names(rep(0, length(coefs)), coefs)
+  w[target] <- 1
+  w[others] <- -1 / length(others)
+  extract_deseq_result(dds, contrast = w)
+}
+
+de_res <- de_meta |>
+  distinct(line_type, cell_line, cell_line_coef) |>
+  mutate(
+    res = map2(
+      line_type, cell_line_coef,
+      \(t, l) one_vs_others(de_fits[[t]], l)
+    )
+  ) |>
+  select(-cell_line_coef) |>
+  unnest(res) |>
+  power_left_join(
+    gene_meta,
+    by = "gene_id",
+    check = check_specs(duplicate_keys_right = "warn")
+  ) |>
+  arrange(line_type, cell_line, padj)
+
+write_csv(
+  de_res,
+  file.path(res_dir, "de_cell_line_vs_other_lines.csv.gz")
+)
+
+de_res |>
+  filter(padj < 0.05, abs(log2FoldChange) > 1) |>
+  count(line_type, cell_line, direction = if_else(log2FoldChange > 0, "up", "down")) |>
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+```
+
+
+
+```{r cluster-helpers}
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+```
+
+
+## FGSEA
+
+- H: Hallmark
+- C6: Oncogenic signatures
+- CP:KEGG_MEDICUS
+- 3CA: Cancer Cell Atlas meta-programs
+
+
+```{r msigdbr-gene-sets}
+
+msigdbr_of_interest <- tribble(
+  ~gs_collection_id, ~collection, ~subcollection,
+  "H", "H", NA,
+  "C6", "C6", NA,
+  "KEGG_MEDICUS", "C2", "CP:KEGG_MEDICUS",
+  "3CA", "C4", "3CA"
+) |>
+  mutate(
+    gs = map2(
+      collection, subcollection,
+      \(c, s) {
+        if (is.na(s)) {
+          msigdbr::msigdbr(species = "Homo sapiens", collection = c)
+        } else {
+          msigdbr::msigdbr(species = "Homo sapiens", collection = c, subcollection = s)
+        }
+      }
+    )
+  )
+
+msigdbr_of_interest_gs <- msigdbr_of_interest |>
+  mutate(
+    gs = map(
+      gs,
+      \(x) x |>
+        filter(!is.na(ensembl_gene), ensembl_gene != "") |>
+        distinct(gs_name, ensembl_gene) |>
+        with(split(ensembl_gene, gs_name))
+    )
+  ) |>
+  select(gs_collection_id, gs)
+```
+
+```{r fgsea-run}
+fgsea_input <- de_res |>
+  drop_na(stat, log2FoldChange) |>
+  pivot_longer(
+    c(log2FoldChange, stat),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  group_by(line_type, cell_line, metric) |>
+  summarize(
+    gene_stats = list(set_names(value, gene_id)),
+    .groups = "drop"
+  )
+
+fgsea_res_raw <- fgsea_input |>
+  cross_join(msigdbr_of_interest_gs) |>
+  mutate(
+    res = map2(
+      gs, gene_stats,
+      \(gs, stats) fgseaMultilevel(
+        gs,
+        stats,
+        minSize = 5,
+        BPPARAM = BiocParallel::MulticoreParam(workers = 4)
+      ) |>
+        as_tibble()
+    )
+  )
+
+fgsea_res <- fgsea_res_raw |>
+  select(-gene_stats, -gs) |>
+  unnest(res)
+
+write_csv(
+  fgsea_res,
+  file.path(res_dir, "fgsea_cell_line_vs_other_lines.csv.gz")
+)
+```
+
+```{r fgsea-heatmaps}
+fgsea_heatmap_data <- fgsea_res |>
+  filter(metric == "stat") |>
+  group_by(gs_collection_id, line_type, pathway) |>
+  filter(any(padj < 0.05)) |>
+  mutate(min_padj = min(padj)) |>
+  group_by(gs_collection_id, line_type) |>
+  # Keep the 40 most significant sets per collection and line type
+  filter(dense_rank(min_padj) <= 40) |>
+  ungroup() |>
+  mutate(
+    signif = case_when(
+      padj < 0.001 ~ "***",
+      padj < 0.01 ~ "**",
+      padj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+fgsea_heatmaps <- fgsea_heatmap_data |>
+  group_nest(gs_collection_id, line_type, keep = TRUE) |>
+  filter(map_int(data, \(d) n_distinct(d$pathway)) > 1) |>
+  mutate(
+    p = pmap(
+      list(data, gs_collection_id, line_type),
+      \(df, coll, lt) {
+        df_clust <- cluster_df(df, pathway, cell_line, NES)
+        lim <- max(abs(df_clust$NES), na.rm = TRUE)
+        ggplot(df_clust, aes(x = cell_line, y = pathway, fill = NES)) +
+          geom_tile() +
+          geom_text(aes(label = signif), vjust = 0.75) +
+          scale_fill_distiller(palette = "RdBu", limits = c(-lim, lim)) +
+          labs(x = NULL, y = NULL, title = paste(lt, coll, sep = " - ")) +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      }
+    )
+  )
+
+pwalk(
+  fgsea_heatmaps,
+  \(gs_collection_id, line_type, data, p, ...) {
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("fgsea_heatmap_", make_clean_names(line_type), "_", make_clean_names(gs_collection_id), ".pdf")
+      ),
+      p,
+      width = 4 + 0.4 * n_distinct(data$cell_line),
+      height = 2 + 0.15 * n_distinct(data$pathway),
+      limitsize = FALSE
+    )
+  }
+)
+```
